@@ -1,5 +1,5 @@
 
--- two-state 4-hop VI protocol
+-- PMSI protocol
 
 ----------------------------------------------------------------------
 -- Constants
@@ -8,10 +8,13 @@ const
   ProcCount: 3;          -- number processors
   ValueCount:   2;       -- number of data values.
   VC0: 0;                -- msg channel
+  BufferSize: 3;   -- buffer size
   
   CoreReqBuffer_size: ProcCount; -- core request buffer
   CoreWBBuffer_size: ProcCount;  -- core write-back buffer
   PRLUT_size: ProcCount; --pending request lookup table
+
+  which_fifo_type:Boolean; --true for PR, false for PWB
 
   QMax: 2;
   NumVCs: VC2 - VC0 + 1;
@@ -32,9 +35,18 @@ type
 
   VCType: VC0..NumVCs-1;
 
+  channelType: 0..ProcCount;
+
   Ackcount:(1-ProcCount)..ProcCount - 1 ;
   -- HeadPtr: 0...(ProcCount + ProcCount - 1);
   -- tailPtr: -1...(ProcCount + ProcCount - 1);
+
+  fifo:
+    Record
+      buf: array [0..BufferSize-1] of Message;
+      head: 0..BufferSize-1;
+      tail: 0..BufferSize-1;
+    end;
 
   MessageType: enum {  GetM,
                        GetS,
@@ -63,6 +75,8 @@ type
         H_M_D
       }; 								--transient states during recall
      val: Value; 
+     PRLUT: fifo;
+     channel: channelType;
     End;
 
   ProcState:
@@ -81,10 +95,11 @@ type
             Proc_IM_D_S
       };
       val: Value;
+      PR:fifo;
+      PWB:fifo;
+      channel: channelType;
+      which_fifo: which_fifo_type;
     End;
-
-
-
 
 ----------------------------------------------------------------------
 -- Variables
@@ -101,15 +116,36 @@ var
   ResBuffer: array [Node] of scalarset [Proc] of Message;
   LastWrite: Value; -- Used to confirm that writes are not lost; this variable would not exist in real hardware
 
+  current_channel: channelType;
+
 ----------------------------------------------------------------------
 -- Procedures
 ----------------------------------------------------------------------
-Procedure Send(
-         mtype:MessageType;
-         dest: Node
-	       src:Node;
-         val:Value;
-         );
+Procedure Enqueue(f:fifo; msg: Message);
+Begin
+  assert f.head != (f.tail + 1) % BufferSize; -- check if the queue is full
+  f.buf[f.tail] := msg;
+  f.tail := (f.tail + 1) % BufferSize;
+End;
+
+Function Dequeue(f:fifo): Message;
+Begin
+  --assert f.head != f.tail; -- check if the queue is not empty
+  if (f.head = f.tail) then
+    return UNDEFINED;
+  endif;
+  var msg := f.buf[f.head];
+  f.head := (f.head + 1) % BufferSize;
+  return msg;
+End;
+
+Procedure ToBuffer(
+            f:fifo;
+            mtype:MessageType;
+            dest: Node;
+            src:Node;
+            val:Value;
+          );
 var msg:Message;
 Begin
   --Assert (MultiSetCount(i:Net[dst], true) < NetMax) "Too many messages";
@@ -117,7 +153,8 @@ Begin
   msg.dest := dest;
   msg.src   := src;
   msg.val   := val;
-  MultiSetAdd(msg, Net[dst]);
+
+  Enqueue(f, msg);
 End;
 
 Procedure ErrorUnhandledMsg(msg:Message; n:Node);
@@ -447,10 +484,10 @@ Begin
         switch msg.mtype
           case GetS:
             ps := Proc_MS_WB;
-            Send(PutM, HomeType, p, pv);
+            ToBuffer(PutM, HomeType, p, pv);
           case GetM:
             ps := Proc_MI_WB;
-            Send(PutM, HomeType, p, pv);
+            ToBuffer(PutM, HomeType, p, pv);
           case Upg:
             ErrorUnhandledMsg(msg, p);
           case PutM:
@@ -535,7 +572,7 @@ Begin
             ErrorUnhandledMsg(msg, p);
           case PutM:
             ps := I;
-            Send(Data, HomeType, p, pv);
+            ToBuffer(Data, HomeType, p, pv);
       else --other
         switch msg.mtype
           case GetS:
@@ -557,7 +594,7 @@ Begin
             ErrorUnhandledMsg(msg, p);
           case PutM:
             ps := S;
-            Send(Data, HomeType, p, pv);
+            ToBuffer(Data, HomeType, p, pv);
       else --other
         switch msg.mtype
           case GetS:
@@ -619,7 +656,7 @@ Begin
         switch msg.mtype
           case Data:
             ps := Proc_MS_WB;
-            Send(PutM, HomeType, p, UNDEFINED);
+            ToBuffer(PutM, HomeType, p, UNDEFINED);
           case Upg:
             ErrorUnhandledMsg(msg, p);
           case PutM:
@@ -661,6 +698,7 @@ ruleset n:Proc Do
 	ruleset v:Value Do
   	rule "P in invalid state store "
    	 (p.state = P_Invalid)
+     (channel = p.n)
     	==>
       Send(GetM, HomeType, n, VC0, UNDEFINED,0,UNDEFINED);
  		  p.state := P_IMAD;  
@@ -772,6 +810,28 @@ ruleset n:Node do
 
 endruleset;
 
+rule
+
+----------- new rules ----------------------
+ruleset n:Proc Do
+  alias p:Procs[n] Do
+    rule "proc send to bus"
+      (current_channel = p.channel)
+    ==>
+      if (p.which_fifo) then
+        --PR dequeue
+      else 
+        --PWB dequeue
+      endif;
+      p.which_fifo := !p.which_fifo;
+  endalias;
+endruleset;
+
+
+rule "increment-channel"
+  current_channel := (current_channel+1) % (ProcCount+1);
+endrule
+
 ----------------------------------------------------------------------
 -- Startstate
 ----------------------------------------------------------------------
@@ -792,7 +852,11 @@ startstate
     Procs[i].state := P_Invalid;
     Procs[i].ackcnt := 0;
     undefine Procs[i].val;
+    Procs[i].channel := i+1;
+    which_fifo := true; --start with PR
   endfor;
+
+  HomeNode.channel := 0;
 
   -- network initialization
   undefine Net;
