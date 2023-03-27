@@ -117,13 +117,14 @@ var
   LastWrite: Value; -- Used to confirm that writes are not lost; this variable would not exist in real hardware
 
   current_channel: channelType;
+  temp_msg: Message
 
 ----------------------------------------------------------------------
 -- Procedures
 ----------------------------------------------------------------------
 Procedure Enqueue(f:fifo; msg: Message);
 Begin
-  assert f.head != (f.tail + 1) % BufferSize; -- check if the queue is full
+  assert (f.head != (f.tail + 1) % BufferSize) "a fifo overflowed!"; -- check if the queue is full
   f.buf[f.tail] := msg;
   f.tail := (f.tail + 1) % BufferSize;
 End;
@@ -139,6 +140,16 @@ Begin
   return msg;
 End;
 
+Function Peek(f:fifo): Message;
+Begin
+  --assert f.head != f.tail; -- check if the queue is not empty
+  if (f.head = f.tail) then
+    return UNDEFINED;
+  endif;
+  var msg := f.buf[f.head];
+  return msg;
+End;
+
 Procedure ToBuffer(
             f:fifo;
             mtype:MessageType;
@@ -146,8 +157,9 @@ Procedure ToBuffer(
             src:Node;
             val:Value;
           );
-var msg:Message;
+var msg:Message; 
 Begin
+  -- data msg counts as WB, everything else counts as pending request
   --Assert (MultiSetCount(i:Net[dst], true) < NetMax) "Too many messages";
   msg.mtype := mtype;
   msg.dest := dest;
@@ -448,27 +460,25 @@ Begin
 
   switch ps
     case Proc_I:
-      ErrorUnhandledMsg(msg, p);
+        ErrorUnhandledMsg(msg, p);
 
     case Proc_S:     
       if (msg.src = p | msg.dest = p) then --own
         switch msg.mtype
-          case Data:
-            ErrorUnhandledMsg(msg, p);
           case Upg:
             ErrorUnhandledMsg(msg, p);
           case PutM:
             ErrorUnhandledMsg(msg, p);
+          case Data:
+            ErrorUnhandledMsg(msg, p);
+          endswitch;
       else --other
         switch msg.mtype
-          case GetS:
-
           case GetM:
             ps := Proc_I;
           case Upg:
             ps := Proc_I;
-          case PutM:
-            ErrorUnhandledMsg(msg, p);
+        endswitch;
       endif;
 
     case Proc_M:     
@@ -484,10 +494,10 @@ Begin
         switch msg.mtype
           case GetS:
             ps := Proc_MS_WB;
-            ToBuffer(PutM, HomeType, p, pv);
+            ToBuffer(p.PR, PutM, HomeType, p, pv);
           case GetM:
             ps := Proc_MI_WB;
-            ToBuffer(PutM, HomeType, p, pv);
+            ToBuffer(p.PR, PutM, HomeType, p, pv);
           case Upg:
             ErrorUnhandledMsg(msg, p);
           case PutM:
@@ -572,7 +582,7 @@ Begin
             ErrorUnhandledMsg(msg, p);
           case PutM:
             ps := I;
-            ToBuffer(Data, HomeType, p, pv);
+            ToBuffer(p.WB, Data, HomeType, p, pv);
       else --other
         switch msg.mtype
           case GetS:
@@ -594,7 +604,7 @@ Begin
             ErrorUnhandledMsg(msg, p);
           case PutM:
             ps := S;
-            ToBuffer(Data, HomeType, p, pv);
+            ToBuffer(p.WB, Data, HomeType, p, pv);
       else --other
         switch msg.mtype
           case GetS:
@@ -656,7 +666,7 @@ Begin
         switch msg.mtype
           case Data:
             ps := Proc_MS_WB;
-            ToBuffer(PutM, HomeType, p, UNDEFINED);
+            ToBuffer(p.PR, PutM, HomeType, p, UNDEFINED);
           case Upg:
             ErrorUnhandledMsg(msg, p);
           case PutM:
@@ -690,129 +700,83 @@ End;
 -- Rules
 ----------------------------------------------------------------------
 
--- Processor actions (affecting coherency)
+-- core events
 
 ruleset n:Proc Do
   alias p:Procs[n] Do
 
 	ruleset v:Value Do
-  	rule "P in invalid state store "
-   	 (p.state = P_Invalid)
-     (channel = p.n)
+  	rule "@ P store"
+   	 (p.state = Proc_I | p.state = Proc_S | p.state = Proc_M | p.state = Proc_MI_WB | p.state = Proc_MS_WB)
     	==>
-      Send(GetM, HomeType, n, VC0, UNDEFINED,0,UNDEFINED);
- 		  p.state := P_IMAD;  
-      p.val :=v;
-      -- LastWrite := p.val;
+      switch p.state
+        case Proc_I:
+          ToBuffer(p.PR, GetM, HomeType, p, UNDEFINED);
+          p.state := Proc_IM_D;
+          
+        case Proc_S:
+          ToBuffer(p.PR, Upg, HomeType, p, v); --forward value to itself
+          p.state := Proc_SM_W;
+
+        case Proc_M:
+          pv := v;
+          LastWrite := v;
+
+        case Proc_MI_WB:
+          pv := v;
+          LastWrite := v;
+
+        case Proc_MS_WB:
+          pv := v;
+          LastWrite := v;
+
+        else
+      
   	endrule;
 	endruleset;
-
-  ruleset v:Value Do
-  	rule "P in share state store "
-   	 (p.state = P_Shared)
-    	==>
-      Send(GetM, HomeType, n, VC0, UNDEFINED,0,UNDEFINED);
- 		  p.state := P_SMAD;  
-      p.val :=v;
-      -- LastWrite := p.val;
-  	endrule;
-	endruleset;
-
-
-  ruleset v:Value Do
-  	rule "P in M state store "
-   	 (p.state = P_Modified)
-    	==>
-        p.val := v;      
-        LastWrite := p.val;
-  	endrule;
-	endruleset;
-
-  rule "P in invalid state load"
-    (p.state = P_Invalid )
-  ==>
-    Send(GetS, HomeType, n, VC0, UNDEFINED,0,UNDEFINED);
-    p.state := P_ISD;
-  endrule;
-
-
-  rule "P in share state evict"
-    (p.state = P_Shared)
-  ==>
-    Send(PutS, HomeType, n, VC0, UNDEFINED,0,UNDEFINED); 
-    p.state := P_SIA;
-  endrule;
-
-    rule "P in M state evict"
-    (p.state = P_Modified)
-  ==>
-    Send(PutM, HomeType, n, VC0, p.val,0,UNDEFINED); 
-    p.state := P_MIA;
-  endrule;
-
-  endalias;
-endruleset;
-
--- Message delivery rules
-ruleset n:Node do
-  choose midx:Net[n] do
-    alias chan:Net[n] do
-    alias msg:chan[midx] do
-    alias box:InBox[n] do
-
-		-- Pick a random message in the network and delivier it
-    rule "receive-net"
-			(isundefined(box[msg.vc].mtype))
-    ==> 
-
-      if IsMember(n, Home)
-      then
-        HomeReceive(msg);
-      else
-        ProcReceive(msg, n);
-			endif;
-
-			if ! msg_processed
-			then
-				-- The node refused the message, stick it in the InBox to block the VC.
-	  		box[msg.vc] := msg;
-			endif;
-	  
-		  MultiSetRemove(midx, chan);
-	  
-    endrule;
   
-    endalias
-    endalias;
-    endalias;
-  endchoose;  
+  rule "@ P load"
+    (p.state = Proc_I | p.state = Proc_S | p.state = Proc_MI_WB | p.state = Proc_MS_WB | p.state = Proc_M )
+  ==>
+    switch p.state
+      case Proc_I:
+        ToBuffer(p.PR, GetS, HomeType, p, UNDEFINED);
+        p.state := Proc_IS_D;
 
-	-- Try to deliver a message from a blocked VC; perhaps the node can handle it now
-	ruleset vc:VCType do
-    rule "receive-blocked-vc"
-			(! isundefined(InBox[n][vc].mtype))
-    ==>
-      if IsMember(n, Home)
-      then
-        HomeReceive(InBox[n][vc]);
+        case Proc_S:
+
+        case Proc_MI_WB:
+
+        case Proc_MS_WB:   
+
+        case Proc_M:     
       else
-        ProcReceive(InBox[n][vc], n);
-			endif;
 
-			if msg_processed
-			then
-				-- Message has been handled, forget it
-	  		undefine InBox[n][vc];
-			endif;
-	  
-    endrule;
-  endruleset;
+    endswitch;
+  endrule;
 
-endruleset;
+  rule "@ P evict"
+    ( p.state = Proc_S | p.state = Proc_M | p.state = Proc_MS_WB )
+  ==>
+    switch p.state
+      case Proc_S:
+        p.state := Proc_I;
 
-rule
+      case Proc_M:
+        ToBuffer(p.PR, PutM, HomeType, p, p.val);      
+        p.state := Proc_MI_WB;
 
------------ new rules ----------------------
+      case Proc_MS_WB:
+        p.state := Proc_MI_WB;
+      
+      else
+
+    endswitch;
+  endrule;
+
+----------- new bus msg passing rules ----------------------
+-- procs can only send one message per window
+
 ruleset n:Proc Do
   alias p:Procs[n] Do
     rule "proc send to bus"
@@ -820,16 +784,38 @@ ruleset n:Proc Do
     ==>
       if (p.which_fifo) then
         --PR dequeue
+        temp_msg := Dequeue(p.PR);
+        if(!isundefined(temp_msg)) then
+          for i:Proc do --all proc receive message
+            ProcReceive(temp_msg, i);
+          endfor;
+          Enqueue(HomeNode.PRLUT, temp_msg);
+        endif;
       else 
-        --PWB dequeue
+        --PWB dequeue (WB are data message)
+        temp_msg := Dequeue(p.PWB);
+        if(!isundefined(temp_msg)) then
+          HomeReceive(temp_msg); 
+        endif;
       endif;
-      p.which_fifo := !p.which_fifo;
+
+      p.which_fifo := !p.which_fifo; --proc fifo arbitor
+      current_channel := (current_channel+1) % (ProcCount+1); -- all nodes arbitor (proc and home rotate)
   endalias;
 endruleset;
 
-
-rule "increment-channel"
-  current_channel := (current_channel+1) % (ProcCount+1);
+--mem consume LUT (can it consume multiple?)
+rule "mem consume LUT"
+    (current_channel = 0)
+  ==>
+    temp_msg := Peek(HomeNode.PRLUT);
+    if(!isundefined(temp_msg)) then
+      HomeReceive(temp_msg);
+      if (msg_processed) then
+        Dequeue(HomeNode.PRLUT);
+      endif;
+    endif;
+    current_channel := (current_channel+1) % (ProcCount+1);
 endrule
 
 ----------------------------------------------------------------------
