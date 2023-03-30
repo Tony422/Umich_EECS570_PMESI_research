@@ -14,13 +14,7 @@ const
   CoreWBBuffer_size: ProcCount;  -- core write-back buffer
   PRLUT_size: ProcCount; --pending request lookup table
 
-  which_fifo_type:Boolean; --true for PR, false for PWB
 
-  QMax: 2;
-  NumVCs: VC2 - VC0 + 1;
-  NetMax: ProcCount+2;
-
-  --MemAddress: 2;
 
 ----------------------------------------------------------------------
 -- Types
@@ -32,21 +26,15 @@ type
   
   Home: enum { HomeType };      -- need enumeration for IsMember calls
   Node: union { Home , Proc };
+  
 
-  VCType: VC0..NumVCs-1;
-
+  which_fifo_type:Boolean;
+  reissue: boolean;
   channelType: 0..ProcCount;
 
   Ackcount:(1-ProcCount)..ProcCount - 1 ;
   -- HeadPtr: 0...(ProcCount + ProcCount - 1);
   -- tailPtr: -1...(ProcCount + ProcCount - 1);
-
-  fifo:
-    Record
-      buf: array [0..BufferSize-1] of Message;
-      head: 0..BufferSize-1;
-      tail: 0..BufferSize-1;
-    end;
 
   MessageType: enum {  GetM,
                        GetS,
@@ -64,19 +52,32 @@ type
       --vc: VCType;
       val: Value;
       --addr: addrType;
+      rei : reissue;
     End;
+
+  fifo:
+    Record
+      buf: array [0..BufferSize-1] of Message;
+      head: 0..BufferSize-1;
+      tail: 0..BufferSize-1;
+    end;
 
   HomeState:
     Record
       state: enum { 
         H_IorS, 
-        H_IorS_D,
         H_M,
-        H_M_D
+        H_IorS_D,
+        H_IorS_A,
+        H_M_D,
+        H_IorS_req,
+        H_M_req
       }; 								--transient states during recall
-     val: Value; 
-     PRLUT: fifo;
-     channel: channelType;
+    val: Value; 
+    PRLUT: fifo;
+    channel: channelType;
+    requestor: Node;
+    owner: Node;
     End;
 
   ProcState:
@@ -99,6 +100,7 @@ type
       PWB:fifo;
       channel: channelType;
       which_fifo: which_fifo_type;
+      reiss: reissue;
     End;
 
 ----------------------------------------------------------------------
@@ -107,24 +109,23 @@ type
 var
   HomeNode:  HomeState;
   Procs: array [Proc] of ProcState;
-  Net:   array [Node] of multiset [NetMax] of Message;  -- One multiset for each destination - messages are arbitrarily reordered by the multiset
-  InBox: array [Node] of array [VCType] of Message;-- If a message is not processed, it is placed in InBox, blocking that virtual channel
   msg_processed: boolean;
-  ReqBuffer: array [Node] of scalarset [Proc] of Message;
-  WBBuffer : array [Node] of scalarset [Proc] of Message;
-  PRLUT : array [Node] of scalarset [Proc] of Message;
-  ResBuffer: array [Node] of scalarset [Proc] of Message;
+  -- ReqBuffer: array [Node] of scalarset [Proc] of Message;
+  -- WBBuffer : array [Node] of scalarset [Proc] of Message;
+  -- PRLUT : array [Node] of scalarset [Proc] of Message;
+  -- ResBuffer: array [Node] of scalarset [Proc] of Message;
   LastWrite: Value; -- Used to confirm that writes are not lost; this variable would not exist in real hardware
 
   current_channel: channelType;
-  temp_msg: Message
+  temp_msg: Message;
+   --true for PR, false for PWB
 
 ----------------------------------------------------------------------
 -- Procedures
 ----------------------------------------------------------------------
 Procedure Enqueue(f:fifo; msg: Message);
 Begin
-  assert (f.head != (f.tail + 1) % BufferSize) "a fifo overflowed!"; -- check if the queue is full
+  --assert (f.head != (f.tail + 1) % BufferSize) "a fifo overflowed!"; -- check if the queue is full
   f.buf[f.tail] := msg;
   f.tail := (f.tail + 1) % BufferSize;
 End;
@@ -135,10 +136,17 @@ Begin
   if (f.head = f.tail) then
     return UNDEFINED;
   endif;
+  
   var msg := f.buf[f.head];
   f.head := (f.head + 1) % BufferSize;
   return msg;
 End;
+
+Procedure BufferReissue(f:fifo);
+Begin
+  f.tail := (f.tail + BufferSize - 1) % BufferSize;
+End;
+
 
 Function Peek(f:fifo): Message;
 Begin
@@ -150,12 +158,14 @@ Begin
   return msg;
 End;
 
+
 Procedure ToBuffer(
             f:fifo;
             mtype:MessageType;
             dest: Node;
             src:Node;
-            val:Value;
+            val:Value
+            
           );
 var msg:Message; 
 Begin
@@ -165,7 +175,6 @@ Begin
   msg.dest := dest;
   msg.src   := src;
   msg.val   := val;
-
   Enqueue(f, msg);
 End;
 
@@ -179,45 +188,28 @@ Begin
   error "Unhandled state!";
 End;
 
+Procedure HomeSend(
+                  mtype:MessageType;
+                  dest: Node;
+                  val:Value
+                );
+var msg:Message; 
+begin
+  msg.mtype := mtype;
+  msg.dest := dest;
+  msg.src   := HomeType;
+  msg.val   := val;
+  for i:Proc do
+    ProcReceive(msg, i);
+  endfor;
+end;
 
 -- These aren't needed for Valid/Invalid protocol, but this is a good way of writing these functions
-Procedure AddToSharersList(n:Node);
-Begin
-  if MultiSetCount(i:HomeNode.sharers, HomeNode.sharers[i] = n) = 0
-  then
-    MultiSetAdd(n, HomeNode.sharers);
-  endif;
-End;
 
-Function IsSharer(n:Node) : Boolean;
-Begin
-  return MultiSetCount(i:HomeNode.sharers, HomeNode.sharers[i] = n) > 0
-End;
-
-Procedure RemoveFromSharersList(n:Node);
-Begin
-  MultiSetRemovePred(i:HomeNode.sharers, HomeNode.sharers[i] = n);
-End;
-
--- Sends a message to all sharers except rqst
-Procedure SendInvReqToSharers(rqst:Node);
-Begin
-  for n:Node do
-    if (IsMember(n, Proc) &
-        MultiSetCount(i:HomeNode.sharers, HomeNode.sharers[i] = n) != 0)
-    then
-      if n != rqst
-      then 
-         Send(Inv,n,HomeType,VC2,UNDEFINED, 0,rqst); 
-      endif;
-    endif;
-  endfor;
-End;
 
 
 
 Procedure HomeReceive(msg:Message);
-var cnt:0..ProcCount;  -- for counting sharers
 Begin
 -- Debug output may be helpful:
 --  put "Receiving "; put msg.mtype; put " on VC"; put msg.vc; 
@@ -226,222 +218,227 @@ Begin
   -- The line below is not needed in Valid/Invalid protocol.  However, the 
   -- compiler barfs if we put this inside a switch, so it is useful to
   -- pre-calculate the sharer count here
-  cnt := MultiSetCount(i:HomeNode.sharers, true);
-
-
+  
+   
   -- default to 'processing' message.  set to false otherwise
   msg_processed := true;
 
   switch HomeNode.state
-  case H_Invalid:
+  case H_IorS:
     switch msg.mtype
+      case GetS:
+        HomeSend(Data, msg.src, HomeNode.val);
 
-    case GetS:
-      HomeNode.state := H_Shared;
-      AddToSharersList(msg.src);
-      Send(data, msg.src, HomeType, VC1, HomeNode.val,0,UNDEFINED);
-    case GetM:
-      HomeNode.state := H_Modified;
-      HomeNode.owner := msg.src;
-      Send(data, msg.src, HomeType, VC1, HomeNode.val,cnt,UNDEFINED);
-    case PutS:
-      Send(PutAck, msg.src, HomeType, VC1, HomeNode.val,0,UNDEFINED);
-    case PutM:
-      Send(PutAck, msg.src, HomeType, VC1, HomeNode.val,0,UNDEFINED);
-    
-    -- case GetAck:
-    else
-      ErrorUnhandledMsg(msg, HomeType);
+      case GetM:
+        HomeNode.state := H_M;
+        HomeSend(Data, msg.src, HomeNode.val);
+        HomeNode.owner := msg.src;
 
-    endswitch;
+      case Upg:
+        HomeNode.state := H_M;
+        HomeNode.owner := msg.src;
 
-  case H_Shared: 
-    switch msg.mtype
-    case GetS:
-      AddToSharersList(msg.src);     
-      Send(data, msg.src, HomeType, VC1, HomeNode.val,0,UNDEFINED);
-                 
-    case GetM:
-      HomeNode.owner := msg.src;
-      if IsSharer(msg.src) then
-         if cnt = 1 then
-           HomeNode.state := H_Modified;   
-           undefine HomeNode.sharers;        
-         else
-          HomeNode.state := HT_SM;
-          HomeNode.ackcnt := cnt -1;
-          SendInvReqToSharers(msg.src);
-          undefine HomeNode.sharers;
-         endif;
-
-         Send(data, msg.src, HomeType, VC1, HomeNode.val,cnt-1,UNDEFINED);
-      else 
-         HomeNode.state := HT_SM;
-         HomeNode.ackcnt := cnt;
-         SendInvReqToSharers(msg.src);
-         undefine HomeNode.sharers;
-         Send(data, msg.src, HomeType, VC1, HomeNode.val,cnt,UNDEFINED);
-      endif;
-      
-
-      case PutS:
-      if IsSharer(msg.src) then
-         if cnt = 1 then
-          HomeNode.state := H_Invalid;
-         endif;
-         endif;
-          RemoveFromSharersList(msg.src);
-          Send(PutAck, msg.src, HomeType, VC1, UNDEFINED,0,UNDEFINED);
       case PutM:
-          if IsSharer(msg.src) then
-            if cnt = 1 then
-             HomeNode.state := H_Invalid;
-            --  undefine HomeNode.sharers;
-          endif;
-          endif;
-          RemoveFromSharersList(msg.src);
-          Send(PutAck, msg.src, HomeType, VC1, UNDEFINED,0,UNDEFINED);
-      
-      -- case GetAck:
-          
-      -- case data :
-      --     HomeNode.val := msg.val;
-    else
-      ErrorUnhandledMsg(msg, HomeType);
-
-    endswitch;
-
-  case H_Modified:
-    switch msg.mtype
-   
-    case GetS:
-      HomeNode.state := HT_MS;
-      AddToSharersList(msg.src);
-      AddToSharersList(HomeNode.owner);
-      Send(FwdGetS, HomeNode.owner, HomeType, VC2, UNDEFINED,0,msg.src);
-      undefine HomeNode.owner;
-
-    case GetM:
-    	HomeNode.state := HT_MM;
-      Send(FwdGetM, HomeNode.owner, HomeType, VC2, UNDEFINED,0,msg.src);
-      HomeNode.owner :=msg.src;
-    
-    case PutS:
-      
-      Send(PutAck, msg.src, HomeType, VC1, UNDEFINED,0,UNDEFINED);
-    
-    case PutM:
-      if HomeNode.owner =msg.src then
-         HomeNode.state := H_Invalid;
-         HomeNode.val := msg.val;
-        --  LastWrite:= msg.val;
-         
-         undefine HomeNode.owner;
-         Send(PutAck, msg.src, HomeType, VC1, UNDEFINED,0,UNDEFINED);
-      else 
-         Send(PutAck, msg.src, HomeType, VC1, UNDEFINED,0,UNDEFINED);
-      endif;
-    -- case GetAck:
-     
-    
-    else
-      ErrorUnhandledMsg(msg, HomeType);
-
-    endswitch;
-    
-  case HT_SM:
-    switch msg.mtype
-
-    case GetS:
-      msg_processed := false;
-
-    case GetM:
-      msg_processed := false;
-
-    case PutS:
-      msg_processed := false;  
-
-    case PutM:
-      msg_processed := false;
-
-    -- case data:
-    --   msg_processed := false;
-    
-    case InvAck:
-      HomeNode.ackcnt := HomeNode.ackcnt-1;
-       if HomeNode.ackcnt =0 then
-          HomeNode.state := H_Modified;
+        if (msg.src = HomeNode.owner) then
+          ErrorUnhandledMsg(msg, HomeType);
+        else
+          --do nothing
         endif;
-    -- case Fwdack:
-    else
-      ErrorUnhandledMsg(msg, HomeType);
+      
+      case Data:
+        if (IsUndefined(msg.requestor)) then 
+          ErrorUnhandledMsg(msg, HomeType);
+        else 
+          ErrorUnhandledMsg(msg, HomeType);
+        endif;
 
+      else
+        ErrorUnhandledMsg(msg, HomeType);
     endswitch;
     
-  case HT_MS:
+
+    case H_M:
+      switch msg.mtype
+        case GetS:
+          undefine HomeNode.owner;
+          requestor := msg.src;
+          HomeNode.state := H_IorS_D;      
+        case GetM:
+          HomeNode.owner := msg.src;
+          requestor := msg.src;
+          HomeNode.state :=H_M_D;
+          
+        case Upg :
+          ErrorUnhandledMsg(msg, HomeType);
+
+        case PutM:
+          if (msg.src = HomeNode.owner) then
+            undefine HomeNode.owner;
+            HomeNode.state := H_IorS_D;
+          endif;
+        
+        case Data:
+          if(isundefined(requestor)) then
+            HomeNode.state := H_IorS_A;
+          else
+             ErrorUnhandledMsg(msg, HomeType);
+          endif;
+          
+        else
+          ErrorUnhandledMsg(msg, HomeType);
+    endswitch;
+    
+
+  case H_IorS_D:
     switch msg.mtype
+      case GetS:
+        msg_processed = false;
 
-    case GetS:
-      msg_processed := false;
+      case GetM:
+        msg_processed = false;
+        
+      case Upg:
+        ErrorUnhandledMsg(msg, HomeType);
 
-    case GetM:
-      msg_processed := false;
+      case PutM:
+        if (msg.src = HomeNode.owner) then
+          msg_processed = false;
+        else
+          --do nothing
+        endif;
+      
+      case Data:
+        if (IsUndefined(msg.requestor)) then 
+          HomeNode.state := H_IorS;
+          HomeNode.val := msg.val;
+        else 
+          HomeNode.state := H_IorS_req;
+          HomeNode.val := msg.val;
+        endif;
 
-    case PutS:
-      msg_processed := false;  
-
-    case PutM:
-      msg_processed := false;
-
-    -- case data:
-    --  if cnt =0 then 
-    --  HomeNode.state := H_Invalid;
-   
-     
-    --  else
-    --  HomeNode.state := H_Shared;
-    --  endif;
-    -- HomeNode.state := H_Shared;
-    -- HomeNode.val := msg.val;
-    case Fwdack:
-     if cnt >0 then 
-     HomeNode.state := H_Shared;    
-     else
-     HomeNode.state := H_Invalid;
-     endif;
-      HomeNode.val := msg.val;
-      --  LastWrite:= msg.val;
-    else
-      ErrorUnhandledMsg(msg, HomeType);
-
+      else
+        ErrorUnhandledMsg(msg, HomeType);
     endswitch;
+    
 
-  case HT_MM:
+    case H_IorS_A:
+      switch msg.mtype
+        case GetS:
+          HomeNode.state := H_IorS;
+          HomeSend(Data, msg.requestor, HomeNode.val);
+        case GetM:
+          HomeNode.state := H_M;
+          HomeNode.owner := msg.src;
+          HomeSend(Data, msg.requestor, HomeNode.val);
+        case Upg:
+          ErrorUnhandledMsg(msg, HomeType);
+        case PutM:
+          if (msg.src = HomeNode.owner) then
+            HomeNode.owner := UNDEFINED;
+            HomeNode.state := H_IorS;
+          else
+            ErrorUnhandledMsg(msg, HomeType);
+          endif;
+        case Data:
+          if (msg.requestor = UNDEFINED) then 
+            ErrorUnhandledMsg(msg, HomeType);
+          else 
+            ErrorUnhandledMsg(msg, HomeType);
+          endif;
+        else
+          ErrorUnhandledMsg(msg, HomeType);
+    endswitch;
+    
+
+  case H_M_D:
     switch msg.mtype
+      case GetS:
+        msg_processed := false;
 
-    case GetS:
-      msg_processed := false;
+      case GetM:
+        msg_processed := false;
 
-    case GetM:
-      msg_processed := false;
+      case Upg:
+        ErrorUnhandledMsg(msg, HomeType);
 
-    case PutS:
-      msg_processed := false;  
+      case PutM:
+        if (msg.src = HomeNode.owner) then
+          ErrorUnhandledMsg(msg, HomeType);
+        else
+          --do nothing
+        endif;
+      
+      case Data:
+        if (msg.requestor = UNDEFINED) then 
+          HomeNode.state := H_M;
+        else 
+          HomeNode.state := H_M_req;
+        endif;
 
-    case PutM:
-      msg_processed := false;
-
-    -- case data:
-    --   msg_processed := false;
+      else
+        ErrorUnhandledMsg(msg, HomeType);
+    endswitch;
     
-    case Fwdack:
-      HomeNode.state := H_Modified;
-    
-    else
-      ErrorUnhandledMsg(msg, HomeType);
+
+  case H_IorS_req:
+    switch msg.mtype
+      case GetS:
+        msg_processed := false;
+
+      case GetM:
+        msg_processed := false;
+
+      case Upg:
+        ErrorUnhandledMsg(msg, HomeType);
+
+      case PutM:
+        if (msg.src = HomeNode.owner) then
+          ErrorUnhandledMsg(msg, HomeType);
+        else
+          --do nothing
+        endif;
+      
+      case Data:
+        if (msg.requestor = UNDEFINED) then 
+          ErrorUnhandledMsg(msg, HomeType);
+        else 
+          ErrorUnhandledMsg(msg, HomeType);
+        endif;
+
+      else
+        ErrorUnhandledMsg(msg, HomeType);
 
     endswitch;
+    
+
+    case H_M_req:
+      switch msg.mtype
+        case GetS:
+          msg_processed := false;
+
+        case GetM:
+          msg_processed := false;
+
+        case Upg:
+          ErrorUnhandledMsg(msg, HomeType);
+
+        case PutM:
+          if (msg.src = HomeNode.owner) then
+            ErrorUnhandledMsg(msg, HomeType);
+          else
+            --do nothing
+          endif;
+        
+        case Data:
+            ErrorUnhandledMsg(msg, HomeType);
+
+        else
+          ErrorUnhandledMsg(msg, HomeType);
+
+    endswitch;
+
   endswitch;
+  
 End;
 
 
@@ -455,34 +452,42 @@ Begin
 
   alias ps:Procs[p].state do
   alias pv:Procs[p].val do
-  alias pack:Procs[p].ackcnt do
-  
+  alias pwbuffer: Procs[p].PWB do
+  alias prebuffer: Procs[p].PR do
+  alias preissue: Procs[p].reiss do
 
   switch ps
     case Proc_I:
         ErrorUnhandledMsg(msg, p);
 
     case Proc_S:     
-      if (msg.src = p | msg.dest = p) then --own
+      if (msg.src = p | (msg.src = HomeType & msg.dest = p)) then --own
         switch msg.mtype
           case Upg:
             ErrorUnhandledMsg(msg, p);
           case PutM:
             ErrorUnhandledMsg(msg, p);
           case Data:
+
+          else
             ErrorUnhandledMsg(msg, p);
-          endswitch;
+
+        endswitch;
       else --other
         switch msg.mtype
           case GetM:
             ps := Proc_I;
           case Upg:
             ps := Proc_I;
+          case Data:
+
+          else
+            ErrorUnhandledMsg(msg, p);
         endswitch;
       endif;
 
     case Proc_M:     
-      if (msg.src = p | msg.dest = p) then --own
+      if (msg.src = p | (msg.src = HomeType & msg.dest = p)) then --own
         switch msg.mtype
           case Data:
             ErrorUnhandledMsg(msg, p);
@@ -490,22 +495,30 @@ Begin
             ErrorUnhandledMsg(msg, p);
           case PutM:
             ErrorUnhandledMsg(msg, p);
+          else
+            ErrorUnhandledMsg(msg, p);
+        endswitch;
       else --other
         switch msg.mtype
           case GetS:
             ps := Proc_MS_WB;
-            ToBuffer(p.PR, PutM, HomeType, p, pv);
+            ToBuffer(prebuffer, PutM, HomeType, p, pv);
           case GetM:
             ps := Proc_MI_WB;
-            ToBuffer(p.PR, PutM, HomeType, p, pv);
+            ToBuffer(prebuffer, PutM, HomeType, p, pv);
           case Upg:
             ErrorUnhandledMsg(msg, p);
           case PutM:
             ErrorUnhandledMsg(msg, p);
+          case Data:
+
+          else
+            ErrorUnhandledMsg(msg, p);
+        endswitch;
       endif;
 
     case Proc_IS_D:
-      if (msg.src = p | msg.dest = p) then --own
+      if (msg.src = p | msg.src = HomeType) then --own
         switch msg.mtype
           case Data:
             ps := Proc_S;
@@ -514,6 +527,11 @@ Begin
             ErrorUnhandledMsg(msg, p);
           case PutM:
             ErrorUnhandledMsg(msg, p);
+          case Data:
+
+          else
+            ErrorUnhandledMsg(msg, p);
+        endswitch;
       else --other
         switch msg.mtype
           case GetS:
@@ -523,11 +541,16 @@ Begin
           case Upg:
             ps := Proc_IS_D_I;
           case PutM:
-            
+
+          case Data:
+
+          else
+            ErrorUnhandledMsg(msg, p);
+        endswitch;
       endif;
 
     case Proc_IM_D:
-      if (msg.src = p | msg.dest = p) then --own
+      if (msg.src = p | msg.src = HomeType) then --own
         switch msg.mtype
           case Data:
             ps := Proc_M;
@@ -536,6 +559,11 @@ Begin
             ErrorUnhandledMsg(msg, p);
           case PutM:
             ErrorUnhandledMsg(msg, p);
+          case Data:
+
+          else
+            ErrorUnhandledMsg(msg, p);
+        endswitch;
       else --other
         switch msg.mtype
           case GetS:
@@ -546,19 +574,28 @@ Begin
             ErrorUnhandledMsg(msg, p);
           case PutM:
             ErrorUnhandledMsg(msg, p);
+          case Data:
+
+          else
+            ErrorUnhandledMsg(msg, p);
+        endswitch;
       endif;
 
     case Proc_SM_W:     
-      if (msg.src = p | msg.dest = p) then --own
+      if (msg.src = p | (msg.src = HomeType & msg.dest = p)) then --own
         switch msg.mtype
           case Data:
-            ErrorUnhandledMsg(msg, p);
+
           case Upg:
             ps := Proc_M;
             pv := msg.val;
             LastWrite := msg.val; --write
           case PutM:
             ErrorUnhandledMsg(msg, p);
+
+          else
+            ErrorUnhandledMsg(msg, p);
+        endswitch;
       else --other
         switch msg.mtype
           case GetS:
@@ -566,23 +603,36 @@ Begin
           case GetM:
             ps := Proc_I;
             --reissue: not last write
+            preissue := true;
+            BufferReissue(prebuffer);
           case Upg:
             ps := Proc_I;
+            preissue := true;
+            BufferReissue(prebuffer);
             --reissue: not last write
           case PutM:
             ErrorUnhandledMsg(msg, p);
+          case Data:
+
+          else
+            ErrorUnhandledMsg(msg, p);
+        endswitch;
       endif;
 
     case Proc_MI_WB:     
-      if (msg.src = p | msg.dest = p) then --own
+      if (msg.src = p | (msg.src = HomeType & msg.dest = p)) then --own
         switch msg.mtype
           case Data:
-            ErrorUnhandledMsg(msg, p);
+            
           case Upg:
             ErrorUnhandledMsg(msg, p);
           case PutM:
             ps := I;
-            ToBuffer(p.WB, Data, HomeType, p, pv);
+            ToBuffer(pwbuffer, Data, HomeType, p, pv);
+
+          else
+            ErrorUnhandledMsg(msg, p);
+        endswitch;
       else --other
         switch msg.mtype
           case GetS:
@@ -593,18 +643,26 @@ Begin
             ErrorUnhandledMsg(msg, p);
           case PutM:
             ErrorUnhandledMsg(msg, p);
+          case Data:
+
+          else
+            ErrorUnhandledMsg(msg, p);
+        endswitch;
       endif;
 
       case Proc_MS_WB:
-      if (msg.src = p | msg.dest = p) then --own
+      if (msg.src = p | (msg.src = HomeType & msg.dest = p)) then --own
         switch msg.mtype
           case Data:
-            ErrorUnhandledMsg(msg, p);
+
           case Upg:
             ErrorUnhandledMsg(msg, p);
           case PutM:
             ps := S;
-            ToBuffer(p.WB, Data, HomeType, p, pv);
+            ToBuffer(pwbuffer, Data, HomeType, p, pv);
+          else
+            ErrorUnhandledMsg(msg, p);
+        endswitch;
       else --other
         switch msg.mtype
           case GetS:
@@ -615,18 +673,29 @@ Begin
             ErrorUnhandledMsg(msg, p);
           case PutM:
             ErrorUnhandledMsg(msg, p);
+          case Data:
+
+          else
+            ErrorUnhandledMsg(msg, p);
+        endswitch;
       endif;
 
     case Proc_IM_D_I:
-      if (msg.src = p | msg.dest = p) then --own
+      if (msg.src = p | (msg.src = HomeType & msg.dest = p)) then --own
         switch msg.mtype
           case Data:
             ps := Proc_MI_WB;
+            ToBuffer(prebuffer, PutM, HomeType, p, UNDEFINED);
             LastWrite := msg.val; --write
           case Upg:
             ErrorUnhandledMsg(msg, p);
           case PutM:
             ErrorUnhandledMsg(msg, p);
+          case Data:
+
+          else
+            ErrorUnhandledMsg(msg, p);
+        endswitch;
       else --other
         switch msg.mtype
           case GetS:
@@ -636,19 +705,28 @@ Begin
           case Upg:
             ErrorUnhandledMsg(msg, p);
           case PutM:
-            
+
+          case Data:
+
+          else
+            ErrorUnhandledMsg(msg, p);
+        endswitch;
       endif;
 
     case Proc_IS_D_I:
-      if (msg.src = p | msg.dest = p) then --own
+      if (msg.src = p | (msg.src = HomeType & msg.dest = p)) then --own
         switch msg.mtype
           case Data:
             ps := I;
+            pv := msg.val;
             LastWrite := msg.val; --write
           case Upg:
             ErrorUnhandledMsg(msg, p);
           case PutM:
             ErrorUnhandledMsg(msg, p);
+          else
+            ErrorUnhandledMsg(msg, p);
+        endswitch;
       else --other
         switch msg.mtype
           case GetS:
@@ -658,19 +736,27 @@ Begin
           case Upg:
             
           case PutM:
-            
+
+          case Data:
+
+          else
+            ErrorUnhandledMsg(msg, p);
+        endswitch;
       endif;
 
     case Proc_IM_D_S:
-      if (msg.src = p | msg.dest = p) then --own
+      if (msg.src = p | (msg.src = HomeType & msg.dest = p)) then --own
         switch msg.mtype
           case Data:
             ps := Proc_MS_WB;
-            ToBuffer(p.PR, PutM, HomeType, p, UNDEFINED);
+            ToBuffer(prebuffer, PutM, HomeType, p, UNDEFINED);
           case Upg:
             ErrorUnhandledMsg(msg, p);
           case PutM:
             ErrorUnhandledMsg(msg, p);
+          else
+            ErrorUnhandledMsg(msg, p);
+        endswitch;
       else --other
         switch msg.mtype
           case GetS:
@@ -680,17 +766,20 @@ Begin
           case Upg:
             ErrorUnhandledMsg(msg, p);
           case PutM:
-            
-      endif;
+          
+          case Data:
 
-  ----------------------------
-  -- Error catch
-  ----------------------------
+          else
+            ErrorUnhandledMsg(msg, p);
+        endswitch;
+      endif;
   else
     ErrorUnhandledState();
 
   endswitch;
   
+  endalias;
+  endalias;
   endalias;
   endalias;
   endalias;
@@ -711,11 +800,13 @@ ruleset n:Proc Do
     	==>
       switch p.state
         case Proc_I:
-          ToBuffer(p.PR, GetM, HomeType, p, UNDEFINED);
+          ToBuffer(p.PR, GetM, HomeType, n, UNDEFINED);
           p.state := Proc_IM_D;
+           pv := v;
+
           
         case Proc_S:
-          ToBuffer(p.PR, Upg, HomeType, p, v); --forward value to itself
+          ToBuffer(p.PR, Upg, HomeType, n, v); --forward value to itself
           p.state := Proc_SM_W;
 
         case Proc_M:
@@ -734,13 +825,26 @@ ruleset n:Proc Do
       
   	endrule;
 	endruleset;
+
+  ruleset v:Value do
+      rule "reissue"
+   (p.state = Proc_I & p.reiss) 
+  ==>
+      ToBuffer(p.PR, GetM, HomeType, n, UNDEFINED);
+      p.state := Proc_IM_D;
+      p.reiss =false;
+      pv := v;
+
+  	endrule;
+	endruleset;
+
   
   rule "@ P load"
     (p.state = Proc_I | p.state = Proc_S | p.state = Proc_MI_WB | p.state = Proc_MS_WB | p.state = Proc_M )
   ==>
     switch p.state
       case Proc_I:
-        ToBuffer(p.PR, GetS, HomeType, p, UNDEFINED);
+        ToBuffer(p.PR, GetS, HomeType, n, UNDEFINED);
         p.state := Proc_IS_D;
 
         case Proc_S:
@@ -763,7 +867,7 @@ ruleset n:Proc Do
         p.state := Proc_I;
 
       case Proc_M:
-        ToBuffer(p.PR, PutM, HomeType, p, p.val);      
+        ToBuffer(p.PR, PutM, HomeType, n, p.val);      
         p.state := Proc_MI_WB;
 
       case Proc_MS_WB:
@@ -774,6 +878,8 @@ ruleset n:Proc Do
     endswitch;
   endrule;
 
+  endalias;
+endruleset;
 ----------- new bus msg passing rules ----------------------
 -- procs can only send one message per window
 
@@ -789,13 +895,14 @@ ruleset n:Proc Do
           for i:Proc do --all proc receive message
             ProcReceive(temp_msg, i);
           endfor;
-          Enqueue(HomeNode.PRLUT, temp_msg);
+          Enqueue(HomeNode.PRLUT, temp_msg); --mem LUT enqueue msg
         endif;
       else 
         --PWB dequeue (WB are data message)
         temp_msg := Dequeue(p.PWB);
         if(!isundefined(temp_msg)) then
-          HomeReceive(temp_msg); 
+          ProcReceive(temp_msg, i);
+          --Enqueue(HomeNode.PRLUT, temp_msg);  --mem LUT enqueue msg
         endif;
       endif;
 
@@ -809,11 +916,21 @@ rule "mem consume LUT"
     (current_channel = 0)
   ==>
     temp_msg := Peek(HomeNode.PRLUT);
-    if(!isundefined(temp_msg)) then
-      HomeReceive(temp_msg);
-      if (msg_processed) then
-        Dequeue(HomeNode.PRLUT);
+    if(HomeNode.state = H_IorS_req) then
+      Homesend(Data,HomeNode.requestor,HomeNode.val);
+      undefine HomeNode.requestor
+      HomeNode.state := H_IorS;
+    elsif(HomeNode.state = H_M_req) then
+      Homesend(Data,HomeNode.requestor,HomeNode.val);
+      undefine HomeNode.requestor
+      HomeNode.state := H_M;   
+    else 
+      if(!isundefined(temp_msg)) then
+        HomeReceive(temp_msg);
+        if (msg_processed) then
+          Dequeue(HomeNode.PRLUT);
       endif;
+    endif;
     endif;
     current_channel := (current_channel+1) % (ProcCount+1);
 endrule
@@ -824,33 +941,37 @@ endrule
 startstate
 
 	For v:Value do
-  -- home node initialization
-  HomeNode.state := H_Invalid;
-  undefine HomeNode.owner;
-  undefine HomeNode.sharers;
-  HomeNode.ackcnt :=0;
-  HomeNode.val := v;
+    -- home node initialization
+    HomeNode.state := H_IorS;
+    undefine HomeNode.owner;
+    undefine HomeNode.requestor;
+    HomeNode.val := v;
 	endfor;
+  HomeNode.channel := 0;
+  HomeNode.PRLUT.head := 0;
+  HomeNode.PRLUT.tail := 0;
+
 	LastWrite := HomeNode.val;
   
   -- processor initialization
   for i:Proc do
-    Procs[i].state := P_Invalid;
-    Procs[i].ackcnt := 0;
+    Procs[i].state := Proc_I;
     undefine Procs[i].val;
     Procs[i].channel := i+1;
-    which_fifo := true; --start with PR
+    Procs[i].which_fifo := true; --start with PR
+    Procs[i].PR.head := 0;
+    Procs[i].PR.tail := 0;
+    Procs[i].PWB.head := 0;
+    Procs[i].PWB.tail := 0;
+    Procs[i].reissue := false;
   endfor;
 
-  HomeNode.channel := 0;
-
-  -- network initialization
-  undefine Net;
 endstartstate;
 
 ----------------------------------------------------------------------
 -- Invariants
 ----------------------------------------------------------------------
+/*
 
 invariant "Invalid implies empty owner"
   HomeNode.state = H_Invalid | HomeNode.state = H_Shared
@@ -921,4 +1042,50 @@ invariant "home in S state implies non-empty sharer list"
           (Procs[m].state != P_Shared & Procs[m].state != P_Modified)
     end
   end;
+*/
 
+
+
+-- const
+--   MAX_QUEUE_SIZE: 10;
+--   NUM_CORES: 2;
+
+-- type
+--   QueueIndex: 0..MAX_QUEUE_SIZE-1;
+--   Core: record
+--     queue: array [QueueIndex] of int;
+--     front: QueueIndex;
+--     rear: QueueIndex;
+--   end;
+
+-- var
+--   cores: array [0..NUM_CORES-1] of Core;
+
+-- function QueueIsEmpty(core_id: 0..NUM_CORES-1): boolean;
+-- begin
+--   return cores[core_id].front = cores[core_id].rear;
+-- endfunction;
+
+-- function QueueIsFull(core_id: 0..NUM_CORES-1): boolean;
+-- begin
+--   return (cores[core_id].rear+1) mod MAX_QUEUE_SIZE = cores[core_id].front;
+-- endfunction;
+
+-- procedure Enqueue(core_id: 0..NUM_CORES-1; item: int);
+-- begin
+--   if not QueueIsFull(core_id) then
+--     cores[core_id].queue[cores[core_id].rear] := item;
+--     cores[core_id].rear := (cores[core_id].rear + 1) mod MAX_QUEUE_SIZE;
+--   endif;
+-- endprocedure;
+
+-- function Dequeue(core_id: 0..NUM_CORES-1): int;
+-- var
+--   item: int;
+-- begin
+--   if not QueueIsEmpty(core_id) then
+--     item := cores[core_id].queue[cores[core_id].front];
+--     cores[core_id].front := (cores[core_id].front + 1) mod MAX_QUEUE_SIZE;
+--     return item;
+--   endif;
+-- endfunction;
